@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"path/filepath"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -13,6 +14,8 @@ import (
 	"os"
 	"sync"
 	"time"
+    "strings"
+    "reflect"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -20,6 +23,7 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
+var extensions []string
 const (
 	namespace = "ssl_expiration"
 )
@@ -121,7 +125,7 @@ func (s *SslExpirationExporter) Describe(ch chan<- *prometheus.Desc) {
 func doCheck(s *SslCheck, checkTimeout time.Duration) (time.Duration, error) {
 
     NotAfter := time.Duration(0)
-    if ( len(s.File) > 0 ) {
+    if ( s.File == "" ) {
         raw, err := ioutil.ReadFile(s.File)
         if err != nil {
             return time.Duration(0), err
@@ -157,6 +161,31 @@ func doCheck(s *SslCheck, checkTimeout time.Duration) (time.Duration, error) {
     return NotAfter, nil
 }
 
+func getCertificates(root string) ([]string, error) {
+    var matches []string
+
+    err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+        if info.IsDir() {
+            return nil
+        }
+
+        for _, ext := range extensions {
+            if ( ext == filepath.Ext(path) ) {
+                matches = append(matches, path)
+            }
+        }
+        return nil
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    return matches, nil
+}
+
 // Collect ...
 func (s *SslExpirationExporter) Collect(ch chan<- prometheus.Metric) {
 	s.mutex.Lock()
@@ -183,6 +212,20 @@ func (s *SslExpirationExporter) Collect(ch chan<- prometheus.Metric) {
     }
     s.daysLeftRound.Set(round)
     s.checkError.Set(float64(0))
+}
+
+func inArray(val interface{}, array interface{}) (result bool) {
+    values := reflect.ValueOf(array)
+
+    if reflect.TypeOf(array).Kind() == reflect.Slice || values.Len() > 0 {
+        for i := 0; i < values.Len(); i++ {
+            if reflect.DeepEqual(val, values.Index(i).Interface()) {
+                return true
+            }
+        }
+    }
+
+    return false
 }
 
 func main() {
@@ -222,6 +265,15 @@ func main() {
 		"Check timeout",
 	)
 
+	var extensionsString string
+	extensionsStringDef := "crt,pem"
+	pflag.StringVar(
+		&extensionsString,
+		"extensions",
+		extensionsStringDef,
+		"Certificate files extensions",
+	)
+
 	pflag.Parse()
 
 	if listen == listenDef && len(os.Getenv("LISTEN")) > 0 {
@@ -240,6 +292,13 @@ func main() {
 			panic(err)
 		}
 	}
+	if extensionsString == extensionsStringDef && len(os.Getenv("FILE_EXTENSIONS")) > 0 {
+		extensionsString = os.Getenv("FILE_EXTENSIONS")
+	}
+
+    for _, ext := range strings.Split(extensionsString,",")  {
+        extensions = append(extensions, "." + ext)
+    }
 
 	var checklist = make([]SslCheck, 256)
 	config, err := ioutil.ReadFile(checklistFile)
@@ -251,15 +310,55 @@ func main() {
 		log.Fatal("Couldn't parse config: ", err)
 	}
 
-	for check := range checklist {
-	    checklist[check].defaults()
-		exporter, err := CreateExporters(checklist[check], checkTimeout)
-		if err != nil {
-			log.Fatal(err)
-		}
+	var checklistStrings []string
+	var checklistParsed []SslCheck
 
-		prometheus.MustRegister(exporter)
+	for check := range checklist {
+	    t := checklist[check]
+	    if ( t.Address == "" && t.Domain == "" && t.File == "" ) {
+            log.Printf("Error: Config error, address/domain/file is required for target: {address: %s, domain: %s, port: %s, file: %s}", t.Address, t.Domain, t.Port, t.File)
+	        continue
+        }
+        t.defaults()
+
+        var ts string
+	    if ( t.File == "" ) {
+            ts = strings.Join([]string {t.Address,t.Domain,t.Port},":")
+            if ( inArray(ts, checklistStrings) ) {
+                log.Printf("Warn: duplicate address/domain/port target: {address: %s, domain: %s, port: %s}", t.Address, t.Domain, t.Port)
+                continue
+            }
+            checklistStrings = append(checklistStrings, ts)
+            checklistParsed = append(checklistParsed, t)
+	    } else {
+            files, err := getCertificates(t.File)
+            if err != nil {
+                log.Fatalf("Err: Invalid target in config file: %s\nerr: %s", t.File, err)
+                continue
+            }
+
+            for _, file := range files {
+                if ( inArray(file, checklistStrings) ) {
+                    log.Printf("Warn: duplicate file target: %s", t.File)
+                    continue
+                }
+	            var tf = SslCheck{File: file}
+                checklistStrings = append(checklistStrings, file)
+                // TODO: check if defaults is needed
+                tf.defaults()
+                checklistParsed = append(checklistParsed, tf)
+            }
+	    }
 	}
+	checklistStrings = nil
+
+    for _, check := range checklistParsed {
+        exporter, err := CreateExporters(check, checkTimeout)
+        if err != nil {
+            log.Fatal(err)
+        }
+        prometheus.MustRegister(exporter)
+    }
 
 	log.Printf("Statring ssl expiration exporter.")
 
