@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -24,6 +26,7 @@ const (
 
 // SslCheck ...
 type SslCheck struct {
+    File string `json:"file"`
 	Address string `json:"address"`
 	Domain string `json:"domain"`
 	Port    string `json:"port"`
@@ -43,7 +46,6 @@ type SslExpirationExporter struct {
 
 // constructor function
 func(params *SslCheck) defaults(){
-    // setting domain to addres if not specified
     if params.Domain == "" {
         params.Domain = params.Address
     }
@@ -65,25 +67,45 @@ func CreateExporters(s SslCheck, checkTimeout time.Duration) (*SslExpirationExpo
 			Namespace:   namespace,
 			Name:        "seconds_left",
 			Help:        "seconds left to expiration",
-			ConstLabels: prometheus.Labels{"instance": fmt.Sprintf("%s:%s", s.Address, s.Port), "domain": fmt.Sprintf("%s", s.Domain)},
+			ConstLabels: prometheus.Labels{
+			    "instance": fmt.Sprintf("%s:%s", s.Address, s.Port),
+			    "domain": fmt.Sprintf("%s", s.Domain),
+			    "address": fmt.Sprintf("%s", s.Address),
+			    "file": fmt.Sprintf("%s", s.File),
+			},
 		}),
 		daysLeft: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   namespace,
 			Name:        "days_left",
 			Help:        "days left to expiration",
-			ConstLabels: prometheus.Labels{"instance": fmt.Sprintf("%s:%s", s.Address, s.Port), "domain": fmt.Sprintf("%s", s.Domain)},
+			ConstLabels: prometheus.Labels{
+			    "instance": fmt.Sprintf("%s:%s", s.Address, s.Port),
+			    "domain": fmt.Sprintf("%s", s.Domain),
+			    "address": fmt.Sprintf("%s", s.Address),
+			    "file": fmt.Sprintf("%s", s.File),
+            },
 		}),
 		daysLeftRound: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   namespace,
 			Name:        "days_left_round",
 			Help:        "days left to expiration round",
-			ConstLabels: prometheus.Labels{"instance": fmt.Sprintf("%s:%s", s.Address, s.Port), "domain": fmt.Sprintf("%s", s.Domain)},
+			ConstLabels: prometheus.Labels{
+			    "instance": fmt.Sprintf("%s:%s", s.Address, s.Port),
+			    "domain": fmt.Sprintf("%s", s.Domain),
+			    "address": fmt.Sprintf("%s", s.Address),
+			    "file": fmt.Sprintf("%s", s.File),
+            },
 		}),
 		checkError: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   namespace,
 			Name:        "check_error",
 			Help:        "check error",
-			ConstLabels: prometheus.Labels{"instance": fmt.Sprintf("%s:%s", s.Address, s.Port), "domain": fmt.Sprintf("%s", s.Domain)},
+			ConstLabels: prometheus.Labels{
+			    "instance": fmt.Sprintf("%s:%s", s.Address, s.Port),
+			    "domain": fmt.Sprintf("%s", s.Domain),
+			    "address": fmt.Sprintf("%s", s.Address),
+			    "file": fmt.Sprintf("%s", s.File),
+            },
 		}),
 	}, nil
 }
@@ -97,22 +119,42 @@ func (s *SslExpirationExporter) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func doCheck(s *SslCheck, checkTimeout time.Duration) (time.Duration, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", s.Address, s.Port), checkTimeout)
-	if err != nil {
-		return time.Duration(0), err
-	}
-	defer conn.Close()
-	config := &tls.Config{
-		ServerName:         s.Domain,
-		InsecureSkipVerify: true,
-	}
-	c := tls.Client(conn, config)
-	err = c.Handshake()
-	if err != nil {
-		return time.Duration(0), err
-	}
 
-	return c.ConnectionState().PeerCertificates[0].NotAfter.Sub(time.Now()), nil
+    NotAfter := time.Duration(0)
+    if ( len(s.File) > 0 ) {
+        raw, err := ioutil.ReadFile(s.File)
+        if err != nil {
+            return time.Duration(0), err
+        }
+        block, _ := pem.Decode([]byte(raw))
+        if block == nil {
+            return time.Duration(0), err
+        }
+
+        cert, err := x509.ParseCertificate(block.Bytes)
+        if err != nil {
+            return time.Duration(0), err
+        }
+
+        NotAfter = cert.NotAfter.Sub(time.Now())
+    } else {
+        conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", s.Address, s.Port), checkTimeout)
+        if err != nil {
+            return time.Duration(0), err
+        }
+        defer conn.Close()
+        config := &tls.Config{
+            ServerName:         s.Domain,
+            InsecureSkipVerify: true,
+        }
+        c := tls.Client(conn, config)
+        err = c.Handshake()
+        if err != nil {
+            return time.Duration(0), err
+        }
+        NotAfter = c.ConnectionState().PeerCertificates[0].NotAfter.Sub(time.Now())
+    }
+    return NotAfter, nil
 }
 
 // Collect ...
@@ -125,21 +167,22 @@ func (s *SslExpirationExporter) Collect(ch chan<- prometheus.Metric) {
 		ch <- s.checkError
 		s.mutex.Unlock()
 	}()
-	res, err := doCheck(s.sslCheck, s.checkTimeout)
-	if err != nil {
-		fmt.Printf("%s\n", err)
-		s.checkError.Set(float64(1))
-		return
-	}
 
-	s.secondsLeft.Set(res.Seconds())
-	s.daysLeft.Set(res.Hours() / 24)
-	round := math.Floor((res.Hours() / 24))
-	if time.Now().Hour() < 12 {
-		round++
-	}
-	s.daysLeftRound.Set(round)
-	s.checkError.Set(float64(0))
+    res, err := doCheck(s.sslCheck, s.checkTimeout)
+    if err != nil {
+        fmt.Printf("%s\n", err)
+        s.checkError.Set(float64(1))
+        return
+    }
+
+    s.secondsLeft.Set(res.Seconds())
+    s.daysLeft.Set(res.Hours() / 24)
+    round := math.Floor((res.Hours() / 24))
+    if time.Now().Hour() < 12 {
+        round++
+    }
+    s.daysLeftRound.Set(round)
+    s.checkError.Set(float64(0))
 }
 
 func main() {
