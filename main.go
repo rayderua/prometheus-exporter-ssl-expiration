@@ -125,7 +125,7 @@ func (s *SslExpirationExporter) Describe(ch chan<- *prometheus.Desc) {
 func doCheck(s *SslCheck, checkTimeout time.Duration) (time.Duration, error) {
 
     NotAfter := time.Duration(0)
-    if ( s.File == "" ) {
+    if ( s.File != "" ) {
         raw, err := ioutil.ReadFile(s.File)
         if err != nil {
             return time.Duration(0), err
