@@ -1,4 +1,8 @@
 ---
-- address: google.com   # Required
-  domain: google.com    # Optional, default: address
+- file: /etc/ssl        # Check certificates in directory
+  exclude:              # Ignore checks for specified directories/files
+    - "/etc/ssl/certs"
+
+- address: google.com   # Required, Host to connect for check
+  domain: google.com    # Optional, Domain to check. default: address
   port: 443             # Optional, default: 443
