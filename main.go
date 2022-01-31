@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +25,10 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-var extensions []string
+var (
+	optExtensions   []string
+	optFileValidate bool
+)
 
 const (
 	namespace = "ssl_expiration"
@@ -130,20 +135,10 @@ func doCheck(s *SslCheck, checkTimeout time.Duration) (time.Duration, error) {
 
 	NotAfter := time.Duration(0)
 	if s.File != "" {
-		raw, err := ioutil.ReadFile(s.File)
+		cert, err := loadCert(s.File)
 		if err != nil {
 			return time.Duration(0), err
 		}
-		block, _ := pem.Decode(raw)
-		if block == nil {
-			return time.Duration(0), err
-		}
-
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return time.Duration(0), err
-		}
-
 		NotAfter = cert.NotAfter.Sub(time.Now())
 	} else {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", s.Address, s.Port), checkTimeout)
@@ -170,9 +165,31 @@ func doCheck(s *SslCheck, checkTimeout time.Duration) (time.Duration, error) {
 	return NotAfter, nil
 }
 
+func loadCert(path string) (*x509.Certificate, error) {
+	raw, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return nil, errors.New("Could not decode")
+	}
+
+	if block.Type != "CERTIFICATE" {
+		return nil, err
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return cert, nil
+}
+
 func getCertificates(root string, exclude []string) ([]string, error) {
 	var matches []string
-
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -187,7 +204,7 @@ func getCertificates(root string, exclude []string) ([]string, error) {
 		}
 
 		if !inArray(path, exclude) {
-			if inArray(filepath.Ext(path), extensions) {
+			if inArray(filepath.Ext(path), optExtensions) {
 				matches = append(matches, path)
 			}
 		}
@@ -237,7 +254,6 @@ func inArray(val interface{}, array interface{}) (result bool) {
 			}
 		}
 	}
-
 	return false
 }
 
@@ -282,9 +298,18 @@ func main() {
 	extensionsStringDef := "crt,pem"
 	pflag.StringVar(
 		&extensionsString,
-		"extensions",
+		"file-extensions",
 		extensionsStringDef,
 		"Certificate files extensions",
+	)
+
+	var fileValidate bool
+	fileValidateDef := true
+	pflag.BoolVar(
+		&fileValidate,
+		"file-validate",
+		fileValidateDef,
+		"Validate for valid certs (do not monitor non CERTIFICATE {file-extensions} files)",
 	)
 
 	pflag.Parse()
@@ -309,8 +334,16 @@ func main() {
 		extensionsString = os.Getenv("FILE_EXTENSIONS")
 	}
 
+	if fileValidate == fileValidateDef && len(os.Getenv("FILE_VALIDATE")) > 0 {
+		boolVal, err := strconv.ParseBool(os.Getenv("FILE_VALIDATE"))
+		if err != nil {
+			optFileValidate = fileValidateDef
+		}
+		optFileValidate = boolVal
+	}
+
 	for _, ext := range strings.Split(extensionsString, ",") {
-		extensions = append(extensions, "."+ext)
+		optExtensions = append(optExtensions, "."+ext)
 	}
 
 	var checklist = make([]SslCheck, 256)
@@ -344,25 +377,45 @@ func main() {
 			checklistStrings = append(checklistStrings, ts)
 			checklistParsed = append(checklistParsed, t)
 		} else {
-			files, err := getCertificates(t.File, t.Exclude)
+			var files []string
+
+			fi, err := os.Stat(t.File)
 			if err != nil {
-				log.Printf("Err: Invalid target in config file: %s\nerr: %s", t.File, err)
+				log.Print(err)
 				continue
 			}
 
-			for _, file := range files {
-				log.Printf("add: %s", file)
-
-				if inArray(file, checklistStrings) {
-					log.Printf("Warn: duplicate file target: %s", t.File)
+			// if target is directory, load certificates with file-validete option
+			// if target is file -add to checks, ignore file-validate option
+			if !fi.IsDir() {
+				var tf = SslCheck{File: t.File}
+				checklistStrings = append(checklistStrings, t.File)
+				checklistParsed = append(checklistParsed, tf)
+			} else {
+				files, err = getCertificates(t.File, t.Exclude)
+				if err != nil {
+					log.Printf("Err: Invalid target in config file: %s\nerr: %s", t.File, err)
 					continue
 				}
-				var tf = SslCheck{File: file}
-				checklistStrings = append(checklistStrings, file)
-				checklistParsed = append(checklistParsed, tf)
+
+				for _, file := range files {
+					if inArray(file, checklistStrings) {
+						continue
+					}
+					_, err := loadCert(file)
+					if optFileValidate == false {
+						if err != nil {
+							continue
+						}
+					}
+					var tf = SslCheck{File: file}
+					checklistStrings = append(checklistStrings, file)
+					checklistParsed = append(checklistParsed, tf)
+				}
 			}
 		}
 	}
+
 	checklistStrings = nil
 
 	for _, check := range checklistParsed {
