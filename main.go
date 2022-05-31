@@ -132,7 +132,6 @@ func (s *SslExpirationExporter) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func doCheck(s *SslCheck, checkTimeout time.Duration) (time.Duration, error) {
-	log.Printf("debug: {address: %s, domain: %s, port: %s, file: %s}", s.Address, s.Domain, s.Port, s.File)
 	NotAfter := time.Duration(0)
 	if s.File != "" {
 		cert, err := loadCert(s.File)
@@ -175,11 +174,10 @@ func loadCert(path string) (*x509.Certificate, error) {
 	if block == nil {
 		return nil, errors.New("Could not decode")
 	}
-	log.Printf("debug: type IN: %s}", block.Type)
+
 	if block.Type != "CERTIFICATE" {
 		return nil, fmt.Errorf("Not CERTIFICATE file  %s", path)
 	}
-	log.Printf("debug: type OUT: %s}", block.Type)
 
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
